@@ -24,14 +24,16 @@ enum DepthType    { DEPTH_NONE, DEPTH_CHILD, DEPTH_ALL };
 class ESPWebDAV {
 public:
   // Start the WiFi server and initialise the SD card.
-  // [STEP 3] spiSettings is forwarded to sd.begin(); callers should pass
-  //          SD_SCK_MHZ(SD_INIT_SPEED_MHZ) instead of SPI_FULL_SPEED so
-  //          the SD init sequence runs at a safe low speed on a shared bus.
-  bool init(int chipSelectPin, SPISettings spiSettings, int serverPort);
+  //
+  // spiSpeed parameter change: the original signature used SPISettings, but
+  // ESP8266SdFat (bundled with ESP8266 core >= 3.x) defines SD_SCK_MHZ() as
+  // a plain uint32_t Hz value, not an SPISettings object. Changed to uint32_t
+  // to match. The value is ignored internally — sd.begin() always uses
+  // SD_SCK_MHZ(SD_INIT_SPEED_MHZ) [STEP 3] for reliability on shared buses.
+  bool init(int chipSelectPin, uint32_t spiSpeed, int serverPort);
 
   // Initialise the SD card only (server already started separately).
-  // [STEP 3] Same note as init(): use SD_SCK_MHZ(SD_INIT_SPEED_MHZ).
-  bool initSD(int chipSelectPin, SPISettings spiSettings);
+  bool initSD(int chipSelectPin, uint32_t spiSpeed);
 
   bool startServer();
   bool isClientWaiting();
@@ -39,20 +41,16 @@ public:
   void rejectClient(String rejectMessage);
 
   // ── MiST FPGA background SD re-init support ─────────────────────────────
-  //
-  // sdMounted: true after a successful sd.begin(). Set by init() / reinitSD().
-  // loop() in ESPWebDAV.ino checks this flag and calls reinitSD() periodically
-  // until the SD card is available.
+  // sdMounted: set true after a successful sd.begin(). loop() checks this
+  // and calls reinitSD() periodically until the SD card is available.
   bool sdMounted;
 
-  // Timestamp of the last reinitSD() attempt, used in loop() to pace retries
-  // at SD_INIT_RETRY_INTERVAL ms.
+  // Timestamp of the last reinitSD() call; used in loop() to pace retries.
   unsigned long lastSdInitAttemptMs;
 
-  // [STEP 2 — retry hook] Called from loop() every SD_INIT_RETRY_INTERVAL ms
-  // while sdMounted is false. Waits for a stable SPI bus window, then calls
-  // sd.begin() at SD_INIT_SPEED_MHZ [STEP 3]. Updates sdMounted.
-  // Returns true if the SD card was successfully initialised.
+  // [STEP 2 retry hook] Called from loop() every SD_INIT_RETRY_INTERVAL ms
+  // while sdMounted is false. Waits for a stable SPI window then retries
+  // sd.begin() at SD_INIT_SPEED_MHZ [STEP 3]. Returns true on success.
   bool reinitSD();
 
 protected:

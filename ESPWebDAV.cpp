@@ -1,16 +1,18 @@
 // WebDAV server using ESP8266 and SD card filesystem
 // Targeting Windows 7 Explorer WebDav
 //
-// MiST FPGA compatibility changes applied:
-//   [STEP 3] init() and initSD() now call sd.begin() at SD_INIT_SPEED_MHZ
-//            (1 MHz) instead of the caller-supplied SPI_FULL_SPEED. This
-//            satisfies the SD spec requirement of <= 400 kHz / 1 MHz during
-//            the initialisation sequence and avoids failures on a shared bus.
-//   [STEP 2] reinitSD() added: called from loop() every SD_INIT_RETRY_INTERVAL
-//            ms while sdMounted is false. Waits for a stable SPI bus window
-//            then retries sd.begin() at SD_INIT_SPEED_MHZ.
-//            handleRequest() returns 503 while sdMounted is false so the
-//            WebDAV client retries automatically.
+// Changes applied for ESP8266 core 3.x / ESP8266SdFat compatibility:
+//   • init() / initSD() now take uint32_t spiSpeed instead of SPISettings
+//     (SD_SCK_MHZ() returns uint32_t in this SdFat version, not SPISettings)
+//   • sd.vwd() is private in SdFat 3.x — replaced with direct open() calls
+//   • dir_t → DirFat_t; FAT_HOUR/MIN/SEC/YEAR/MONTH/DAY → FS_* equivalents
+//   • writeStart() now takes only 1 argument (sector) in SdFat 3.x
+//   • startServer() missing return value fixed
+//
+// MiST FPGA compatibility changes:
+//   [STEP 2] reinitSD(): background retry hook called from loop()
+//   [STEP 3] sd.begin() always uses SD_INIT_SPEED_MHZ (1 MHz) regardless
+//            of the spiSpeed argument; the caller-supplied value is ignored
 
 #include <ESP8266WiFi.h>
 #include <SPI.h>
@@ -20,6 +22,7 @@
 #include "ESPWebDAV.h"
 #include "sdControl.h"
 #include "config.h"
+#include "pins.h"
 
 // Calendar string constants
 const char *months[] = {"Jan","Feb","Mar","Apr","May","Jun",
@@ -32,15 +35,12 @@ const char *wdays[]  = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 //
 // Start the WiFi server and initialise the SD card.
 //
-// [STEP 3] The original code passed the caller-supplied spiSettings directly
-// to sd.begin(). network.cpp calls this with SPI_FULL_SPEED (~50 MHz), which
-// violates the SD spec for the init sequence and causes reliable failures on
-// a shared bus with the MiST ARM IO Controller.
-// Fix: always use SD_SCK_MHZ(SD_INIT_SPEED_MHZ) for sd.begin() regardless
-// of what spiSettings the caller provides. SdFat negotiates a higher speed
-// automatically after a successful init.
+// spiSpeed is accepted for API compatibility but intentionally ignored.
+// [STEP 3] sd.begin() always uses SD_INIT_SPEED_MHZ (1 MHz) to satisfy the
+// SD spec init requirement (<= 400 kHz / 1 MHz) and for reliability on the
+// shared SPI bus of the MiST FPGA. SdFat negotiates a higher speed after init.
 // ────────────────────────────────────────────────────────────────────────────
-bool ESPWebDAV::init(int chipSelectPin, SPISettings spiSettings, int serverPort) {
+bool ESPWebDAV::init(int chipSelectPin, uint32_t spiSpeed, int serverPort) {
   sdMounted           = false;
   lastSdInitAttemptMs = 0;
 
@@ -48,19 +48,17 @@ bool ESPWebDAV::init(int chipSelectPin, SPISettings spiSettings, int serverPort)
   server = new WiFiServer(serverPort);
   server->begin();
 
-  // [STEP 3] Use low init speed instead of the caller-supplied spiSettings
+  // [STEP 3] Low-speed init regardless of caller-supplied spiSpeed
   sdMounted = sd.begin(chipSelectPin, SD_SCK_MHZ(SD_INIT_SPEED_MHZ));
   return sdMounted;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// initSD()
-//
-// Initialise the SD card only (server already started elsewhere).
-// [STEP 3] Same low-speed fix as init().
+// initSD() — initialise SD card only (server started separately)
+// [STEP 3] Same low-speed init as init().
 // ────────────────────────────────────────────────────────────────────────────
-bool ESPWebDAV::initSD(int chipSelectPin, SPISettings spiSettings) {
-  // [STEP 3] Use low init speed for reliable init on a shared bus
+bool ESPWebDAV::initSD(int chipSelectPin, uint32_t spiSpeed) {
+  // [STEP 3] Low-speed init for reliability on a shared bus
   sdMounted = sd.begin(chipSelectPin, SD_SCK_MHZ(SD_INIT_SPEED_MHZ));
   return sdMounted;
 }
@@ -69,6 +67,7 @@ bool ESPWebDAV::initSD(int chipSelectPin, SPISettings spiSettings) {
 bool ESPWebDAV::startServer() {
 // ------------------------
   server->begin();
+  return true; // missing return fixed
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -77,22 +76,19 @@ bool ESPWebDAV::startServer() {
 // [STEP 2 — background retry hook] Called from loop() every
 // SD_INIT_RETRY_INTERVAL ms while sdMounted is false.
 //
-// Flow:
-//   1. Quick check via canWeTakeBus() — bail out if bus is in active use.
-//   2. Wait for a stable SPI window (CS_SENSE HIGH for SD_CS_STABLE_MS ms).
-//   3. Acquire the bus, attempt sd.begin() at SD_INIT_SPEED_MHZ [STEP 3].
-//   4. Release the bus, update sdMounted, return result.
+// Uses a short 3 s window timeout so loop() is not blocked for long;
+// the full SD_BUS_WAIT_TIMEOUT_MS window is used by sdcontrol.setup()
+// at startup. If no window is found here the next retry will try again.
 // ────────────────────────────────────────────────────────────────────────────
 bool ESPWebDAV::reinitSD() {
   lastSdInitAttemptMs = millis();
 
-  // Quick bail-out: bus is currently in use
+  // Quick bail-out: bus is in active use right now
   if (!sdcontrol.canWeTakeBus()) {
     return false;
   }
 
-  // Wait for a genuine stable window (shorter timeout than setup() to avoid
-  // blocking loop() for too long — we will retry on the next interval anyway)
+  // Wait for a stable window (short timeout to avoid blocking loop())
   if (!sdcontrol.waitForStableBusWindow(3000)) {
     return false;
   }
@@ -133,11 +129,9 @@ void ESPWebDAV::handleReject(String rejectMessage) {
 // ------------------------
   DBG_PRINT("Rejecting request: "); DBG_PRINTLN(rejectMessage);
 
-  // handle options
   if (method.equals("OPTIONS"))
     return handleOptions(RESOURCE_NONE);
 
-  // handle properties
   if (method.equals("PROPFIND")) {
     sendHeader("Allow", "PROPFIND,OPTIONS,DELETE,COPY,MOVE");
     setContentLength(CONTENT_LENGTH_UNKNOWN);
@@ -153,7 +147,6 @@ void ESPWebDAV::handleReject(String rejectMessage) {
     sendContent(F("</D:multistatus>"));
     return;
   } else {
-    // if reached here, means its a 404
     handleNotFound();
   }
 }
@@ -167,7 +160,7 @@ void ESPWebDAV::handleRequest(String blank) {
 // ------------------------
 
   // [STEP 2] SD not yet mounted: return 503 so the WebDAV client retries.
-  // loop() will call reinitSD() in the background until the card is ready.
+  // loop() calls reinitSD() in the background until the card is available.
   if (!sdMounted) {
     send("503 Service Unavailable", "text/plain",
          "SD Card not available. Retrying in background.");
@@ -177,9 +170,9 @@ void ESPWebDAV::handleRequest(String blank) {
 
   ResourceType resource = RESOURCE_NONE;
 
-  // Does uri refer to a file, directory, or nothing?
+  // SdFat 3.x: sd.vwd() is private — open directly without vwd() argument
   FatFile tFile;
-  if (tFile.open(sd.vwd(), uri.c_str(), O_READ)) {
+  if (tFile.open(uri.c_str(), O_READ)) {
     resource = tFile.isDir() ? RESOURCE_DIR : RESOURCE_FILE;
     tFile.close();
   }
@@ -188,43 +181,20 @@ void ESPWebDAV::handleRequest(String blank) {
   DBG_PRINT(" r: "); DBG_PRINT(resource);
   DBG_PRINT(" u: "); DBG_PRINTLN(uri);
 
-  // Add header sent every time
   sendHeader("DAV", "2");
 
-  if (method.equals("PROPFIND"))
-    return handleProp(resource);
+  if (method.equals("PROPFIND"))  return handleProp(resource);
+  if (method.equals("GET"))       return handleGet(resource, true);
+  if (method.equals("HEAD"))      return handleGet(resource, false);
+  if (method.equals("OPTIONS"))   return handleOptions(resource);
+  if (method.equals("PUT"))       return handlePut(resource);
+  if (method.equals("LOCK"))      return handleLock(resource);
+  if (method.equals("UNLOCK"))    return handleUnlock(resource);
+  if (method.equals("PROPPATCH")) return handlePropPatch(resource);
+  if (method.equals("MKCOL"))     return handleDirectoryCreate(resource);
+  if (method.equals("MOVE"))      return handleMove(resource);
+  if (method.equals("DELETE"))    return handleDelete(resource);
 
-  if (method.equals("GET"))
-    return handleGet(resource, true);
-
-  if (method.equals("HEAD"))
-    return handleGet(resource, false);
-
-  if (method.equals("OPTIONS"))
-    return handleOptions(resource);
-
-  if (method.equals("PUT"))
-    return handlePut(resource);
-
-  if (method.equals("LOCK"))
-    return handleLock(resource);
-
-  if (method.equals("UNLOCK"))
-    return handleUnlock(resource);
-
-  if (method.equals("PROPPATCH"))
-    return handlePropPatch(resource);
-
-  if (method.equals("MKCOL"))
-    return handleDirectoryCreate(resource);
-
-  if (method.equals("MOVE"))
-    return handleMove(resource);
-
-  if (method.equals("DELETE"))
-    return handleDelete(resource);
-
-  // if reached here, means its a 404
   handleNotFound();
 }
 
@@ -259,7 +229,7 @@ void ESPWebDAV::handleLock(ResourceType resource) {
     return handleNotFound();
 
   buf[contentLen] = 0;
-  String inXML   = String((char*) buf);
+  String inXML    = String((char*) buf);
   int    startIdx = inXML.indexOf("<D:href>");
   int    endIdx   = inXML.indexOf("</D:href>");
   if (startIdx < 0 || endIdx < 0)
@@ -321,6 +291,7 @@ void ESPWebDAV::handleProp(ResourceType resource) {
   sendContent(F("<?xml version=\"1.0\" encoding=\"utf-8\"?>"));
   sendContent(F("<D:multistatus xmlns:D=\"DAV:\">"));
 
+  // SdFat 3.x: open directly without vwd()
   SdFile baseFile;
   baseFile.open(uri.c_str(), O_READ);
   sendPropResponse(false, &baseFile);
@@ -355,20 +326,27 @@ void ESPWebDAV::sendPropResponse(boolean recursing, FatFile *curFile) {
       fullResPath += "/" + String(buf);
   }
 
-  // Get file modified time
-  dir_t dir;
+  // SdFat 3.x API:
+  //   • struct renamed: dir_t → DirFat_t
+  //   • field renamed:  lastWriteTime → modifyTime, lastWriteDate → modifyDate
+  //   • fields are uint8_t[2] (little-endian); cast to uint16_t to read them
+  //     (same approach used by ESP8266 Arduino core's SDFS.h)
+  //   • time macros renamed: FAT_* → FS_*
+  DirFat_t dir;
   curFile->dirEntry(&dir);
 
-  // Convert to required format
+  uint16_t modTime = *(uint16_t*)dir.modifyTime;
+  uint16_t modDate = *(uint16_t*)dir.modifyDate;
+
   tm tmStr;
-  tmStr.tm_hour = FAT_HOUR(dir.lastWriteTime);
-  tmStr.tm_min  = FAT_MINUTE(dir.lastWriteTime);
-  tmStr.tm_sec  = FAT_SECOND(dir.lastWriteTime);
-  tmStr.tm_year = FAT_YEAR(dir.lastWriteDate) - 1900;
-  tmStr.tm_mon  = FAT_MONTH(dir.lastWriteDate) - 1;
-  tmStr.tm_mday = FAT_DAY(dir.lastWriteDate);
-  time_t t2t  = mktime(&tmStr);
-  tm    *gTm  = gmtime(&t2t);
+  tmStr.tm_hour = FS_HOUR(modTime);
+  tmStr.tm_min  = FS_MINUTE(modTime);
+  tmStr.tm_sec  = FS_SECOND(modTime);
+  tmStr.tm_year = FS_YEAR(modDate) - 1900;
+  tmStr.tm_mon  = FS_MONTH(modDate) - 1;
+  tmStr.tm_mday = FS_DAY(modDate);
+  time_t t2t = mktime(&tmStr);
+  tm    *gTm = gmtime(&t2t);
 
   // Tue, 13 Oct 2015 17:07:35 GMT
   sprintf(buf, "%s, %02d %s %04d %02d:%02d:%02d GMT",
@@ -410,10 +388,10 @@ void ESPWebDAV::handleGet(ResourceType resource, bool isGet) {
   SdFile  rFile;
   long    tStart = millis();
   uint8_t buf[1460];
-  rFile.open(uri.c_str(), O_READ);
+  rFile.open(uri.c_str(), O_READ); // SdFat 3.x: no vwd() needed
 
   sendHeader("Allow", "PROPFIND,OPTIONS,DELETE,COPY,MOVE,HEAD,POST,PUT,GET");
-  size_t fileSize   = rFile.fileSize();
+  size_t fileSize    = rFile.fileSize();
   setContentLength(fileSize);
   String contentType = getMimeType(uri);
   if (uri.endsWith(".gz") &&
@@ -424,7 +402,7 @@ void ESPWebDAV::handleGet(ResourceType resource, bool isGet) {
   send("200 OK", contentType.c_str(), "");
 
   if (isGet) {
-    // Send the file — SD read speed ~17 s for a 4.5 MB file
+    // SD read speed ~17 s for a 4.5 MB file
     while (rFile.available()) {
       int numRead = rFile.read(buf, sizeof(buf));
       client.write(buf, numRead);
@@ -462,7 +440,7 @@ void ESPWebDAV::handlePut(ResourceType resource) {
   if (contentLen != 0) {
     const size_t WRITE_BLOCK_CONST = 512;
     uint8_t      buf[WRITE_BLOCK_CONST];
-    long         tStart      = millis();
+    long         tStart       = millis();
     size_t       numRemaining = contentLen;
 
     nFile.close();
@@ -471,13 +449,15 @@ void ESPWebDAV::handlePut(ResourceType resource) {
     size_t   contBlocks = (contentLen / WRITE_BLOCK_CONST + 1);
     uint32_t bgnBlock, endBlock;
 
-    if (!nFile.createContiguous(sd.vwd(), uri.c_str(), contBlocks * WRITE_BLOCK_CONST))
+    // SdFat 3.x: createContiguous() no longer takes vwd() as first argument
+    if (!nFile.createContiguous(uri.c_str(), contBlocks * WRITE_BLOCK_CONST))
       return handleWriteError("File create contiguous sections failed", &nFile);
 
     if (!nFile.contiguousRange(&bgnBlock, &endBlock))
       return handleWriteError("Unable to get contiguous range", &nFile);
 
-    if (!sd.card()->writeStart(bgnBlock, contBlocks))
+    // SdFat 3.x: writeStart() takes only the start sector (1 argument)
+    if (!sd.card()->writeStart(bgnBlock))
       return handleWriteError("Unable to start writing contiguous range", &nFile);
 
     while (numRemaining > 0) {

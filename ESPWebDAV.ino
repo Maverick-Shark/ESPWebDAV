@@ -2,14 +2,12 @@
 // Printer controller is a variation of Rambo running Marlin firmware.
 //
 // MiST FPGA compatibility changes:
-//   setup(): sdcontrol.setup() now applies SD_BOOT_DELAY_MS [STEP 1] and
-//            waits for a stable SPI bus window [STEP 2] before returning,
-//            so network.start() -> dav.init() -> sd.begin() runs inside a
-//            known-idle window at SD_INIT_SPEED_MHZ [STEP 3].
-//   loop():  [STEP 2] background retry — if dav.init() failed (dav.sdMounted
-//            is false), dav.reinitSD() is called every SD_INIT_RETRY_INTERVAL
-//            ms until the SD card is successfully initialised.
+//   setup(): sdcontrol.setup() applies SD_BOOT_DELAY_MS [STEP 1] and
+//            waitForStableBusWindow() [STEP 2] before returning.
+//   loop():  [STEP 2] background retry — dav.reinitSD() called every
+//            SD_INIT_RETRY_INTERVAL ms while dav.sdMounted is false.
 
+#include "ESPWebDAV.h"   // required for dav object — was missing in original
 #include "serial.h"
 #include "parser.h"
 #include "config.h"
@@ -33,7 +31,7 @@ void setup() {
   //   • attaches the CS_SENSE interrupt (unchanged)
   //   • [STEP 1] waits SD_BOOT_DELAY_MS ms (yield-based, WiFi stays alive)
   //   • [STEP 2] calls waitForStableBusWindow() so the bus is idle when
-  //              network.start() -> dav.init() -> sd.begin() executes next
+  //              network.start() -> startDAVServer() -> dav.init() runs next
   sdcontrol.setup();
 
   // ----- WiFi + WebDAV + SD init -----
@@ -61,17 +59,14 @@ void loop() {
   // Handle WebDAV / network requests
   network.handle();
 
-  // Handle serial gcode commands (M50 / M51 / M52 / M53)
+  // Handle serial gcode commands (M50/M51/M52/M53)
   gcode.Handle();
 
   // [STEP 2] Background SD re-init retry ─────────────────────────────────
-  // If sd.begin() failed during setup() (e.g. the MiST ARM IO Controller
-  // was still actively using the SPI bus), retry here every
-  // SD_INIT_RETRY_INTERVAL ms.
-  // dav.reinitSD() calls waitForStableBusWindow(), takeBusControl(),
-  // sd.begin() at SD_INIT_SPEED_MHZ [STEP 3], and relinquishBusControl().
-  // While dav.sdMounted is false, handleRequest() returns 503 so the
-  // WebDAV client retries automatically.
+  // If dav.init() failed during setup() (MiST ARM had the SPI bus busy),
+  // retry here every SD_INIT_RETRY_INTERVAL ms until the SD card mounts.
+  // dav.reinitSD() calls waitForStableBusWindow() + sd.begin() at
+  // SD_INIT_SPEED_MHZ [STEP 3]. handleRequest() returns 503 until ready.
   if (!dav.sdMounted) {
     unsigned long now = millis();
     if (now - dav.lastSdInitAttemptMs >= SD_INIT_RETRY_INTERVAL) {
